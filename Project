@@ -1,0 +1,355 @@
+# System & utilities
+import os, gc, time, math, re, string, warnings
+import pandas as pd
+import numpy as np
+
+# Sklearn - preprocessing, models, metrics
+from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score,
+                             classification_report, confusion_matrix, roc_auc_score)
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
+from sklearn.pipeline import Pipeline
+from sklearn.utils import class_weight
+
+# ML models
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC, SVC
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.naive_bayes import MultinomialNB, GaussianNB
+
+# DL embeddings & NLP
+from gensim.models import Word2Vec, FastText
+from gensim.models import KeyedVectors  # for pre-trained embeddings
+import emoji
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+
+# Visualization
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Utilities
+import joblib
+from tqdm import tqdm
+
+# Transformers (Hugging Face)
+import torch
+from transformers import (AutoTokenizer, AutoModel, AutoModelForSequenceClassification,
+                          Trainer, TrainingArguments)
+
+# Hugging Face Hub
+from huggingface_hub import HfApi, HfFolder, Repository, login
+
+# Keras / TensorFlow (DL models)
+import tensorflow as tf
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import (Embedding, Dense, Dropout, Conv1D, MaxPooling1D, Flatten,
+                                     LSTM, GRU, SimpleRNN, Bidirectional, GlobalAveragePooling1D)
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+
+print("✅ All libraries imported successfully")
+print("Torch:", torch.__version__, " | TensorFlow:", tf.__version__)
+#############################################################################################################################################
+
+# Load Data
+DATA_PATH = "/content/Complete Data With Emoji.csv"  # path in Colab
+df = pd.read_csv(DATA_PATH, encoding="utf-8")
+TEXT_COL = "Tweet_Text_With_Emoji"
+LABEL_COL = "Label"
+print("Rows:", len(df))
+display(df.head())
+#############################################################################################################################################
+
+# Label Encode
+le = LabelEncoder()
+df['label_enc'] = le.fit_transform(df[LABEL_COL].astype(str))
+num_classes = len(le.classes_)
+print("Classes:", le.classes_, "Num:", num_classes)
+#############################################################################################################################################
+
+# Train-Test Split
+X = df[TEXT_COL].astype(str).tolist()
+y = df['label_enc'].tolist()
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y)
+print("Train:", len(X_train), "Test:", len(X_test))
+#############################################################################################################################################
+
+# Feature Extraction
+# 3A: TF-IDF
+tfidf = TfidfVectorizer(max_features=5000, ngram_range=(1,2))
+X_train_tfidf = tfidf.fit_transform(X_train)
+X_test_tfidf = tfidf.transform(X_test)
+print("TF-IDF shapes:", X_train_tfidf.shape, X_test_tfidf.shape)
+
+# 3B: Word2Vec (train on full texts tokenized)
+sentences = [s.split() for s in X]  # simple whitespace tokenization; adapt if you have better tokenizer
+w2v = Word2Vec(sentences, vector_size=100, window=5, min_count=2, workers=4, epochs=10)
+wv_dim = w2v.wv.vector_size
+def avg_w2v_features(texts, model=w2v, dim=wv_dim):
+    fv = []
+    for t in texts:
+        words = t.split()
+        vecs = [model.wv[w] for w in words if w in model.wv]
+        if vecs:
+            fv.append(np.mean(vecs, axis=0))
+        else:
+            fv.append(np.zeros(dim))
+    return np.vstack(fv)
+X_train_w2v = avg_w2v_features(X_train)
+X_test_w2v  = avg_w2v_features(X_test)
+print("W2V shapes:", X_train_w2v.shape, X_test_w2v.shape)
+
+# 3C: FastText
+ft = FastText(sentences, vector_size=100, window=5, min_count=2, workers=4, epochs=10)
+ft_dim = ft.wv.vector_size
+def avg_ft_features(texts, model=ft, dim=ft_dim):
+    fv = []
+    for t in texts:
+        words = t.split()
+        vecs = [model.wv[w] for w in words if w in model.wv]
+        if vecs:
+            fv.append(np.mean(vecs, axis=0))
+        else:
+            fv.append(np.zeros(dim))
+    return np.vstack(fv)
+X_train_ft = avg_ft_features(X_train)
+X_test_ft = avg_ft_features(X_test)
+print("FastText shapes:", X_train_ft.shape, X_test_ft.shape)
+
+# 3D: Emoji2Vec - simple approach: extract only emojis and run char ngram TF-IDF on emoji strings
+EMOJI_PATTERN = re.compile("["
+        u"\U0001F600-\U0001F64F"  # emoticons
+        u"\U0001F300-\U0001F5FF"  # symbols & pictographs
+        u"\U0001F680-\U0001F6FF"  # transport & map symbols
+        u"\U0001F1E0-\U0001F1FF"  # flags
+                           "]+", flags=re.UNICODE)
+def extract_emojis(text):
+    ems = EMOJI_PATTERN.findall(text)
+    return " ".join(ems) if ems else ""
+X_train_emoji = [extract_emojis(t) for t in X_train]
+X_test_emoji  = [extract_emojis(t) for t in X_test]
+emoji_vec = TfidfVectorizer(analyzer='char', ngram_range=(1,3), min_df=1)
+X_train_emoji_tf = emoji_vec.fit_transform(X_train_emoji)
+X_test_emoji_tf  = emoji_vec.transform(X_test_emoji)
+print("Emoji TF shapes:", X_train_emoji_tf.shape, X_test_emoji_tf.shape)
+
+# 3E: BERT (XLM-R) CLS embeddings (batched)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Using device:", device)
+tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base")
+bert = AutoModel.from_pretrained("xlm-roberta-base").to(device)
+bert.eval()
+def get_bert_cls(texts, batch_size=16):
+    emb = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        enc = tokenizer(batch, truncation=True, padding=True, max_length=128, return_tensors="pt").to(device)
+        with torch.no_grad():
+            out = bert(**enc)
+        cls = out.last_hidden_state[:,0,:].cpu().numpy()
+        emb.append(cls)
+    return np.vstack(emb)
+print("Computing BERT embeddings for train & test (this may take some time)...")
+X_train_bert = get_bert_cls(X_train, batch_size=16)
+X_test_bert  = get_bert_cls(X_test, batch_size=16)
+print("BERT shapes:", X_train_bert.shape, X_test_bert.shape)
+#############################################################################################################################################
+
+# Prepare data for DL models
+MAX_WORDS = 20000
+MAX_LEN = 80
+tk = Tokenizer(num_words=MAX_WORDS, oov_token="<OOV>")
+tk.fit_on_texts(X)
+vocab_size = min(MAX_WORDS, len(tk.word_index)+1)
+print("Vocab size:", vocab_size)
+X_train_seq = tk.texts_to_sequences(X_train)
+X_test_seq = tk.texts_to_sequences(X_test)
+X_train_pad = pad_sequences(X_train_seq, maxlen=MAX_LEN, padding='post', truncating='post')
+X_test_pad  = pad_sequences(X_test_seq, maxlen=MAX_LEN, padding='post', truncating='post')
+
+def build_embedding_matrix(model_name, model, token_index, dim):
+    emb_matrix = np.zeros((vocab_size, dim))
+    for word, i in token_index.items():
+        if i>=vocab_size: continue
+        if model_name == "TFIDF" or model_name == "Emoji2Vec":
+            if word in model.vocabulary_:
+                vocab_index = model.vocabulary_[word]
+                emb_matrix[i][0] = model.idf_[vocab_index]
+            else:
+                 emb_matrix[i][0] = np.random.normal(scale=0.1, size=(1,))[0]
+        elif model_name == "Word2Vec" or model_name == "FastText":
+            if hasattr(model, 'wv') and word in model.wv:
+                emb_matrix[i] = model.wv[word]
+            else:
+                emb_matrix[i] = np.random.normal(scale=0.6, size=(dim,))
+        elif model_name == "BERT":
+             emb_matrix[i] = np.random.normal(scale=0.6, size=(dim,))
+    return emb_matrix
+
+tfidf_emb_matrix = build_embedding_matrix("TFIDF", tfidf, tk.word_index, 1)
+emoji_vec_emb_matrix = build_embedding_matrix("Emoji2Vec", emoji_vec, tk.word_index, 1)
+w2v_emb_matrix = build_embedding_matrix("Word2Vec", w2v, tk.word_index, wv_dim)
+ft_emb_matrix  = build_embedding_matrix("FastText", ft, tk.word_index, ft_dim)
+bert_emb_matrix = build_embedding_matrix("BERT", None, tk.word_index, X_train_bert.shape[1])
+
+y_train_cat = to_categorical(y_train, num_classes=num_classes)
+y_test_cat  = to_categorical(y_test, num_classes=num_classes)
+#############################################################################################################################################
+
+# Evaluation function (already corrected)
+def eval_and_report(name, y_true, y_pred, labels_list=None, output_prefix=None):
+    acc = accuracy_score(y_true, y_pred)
+    prec_macro = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    rec_macro = recall_score(y_true, y_pred, average='macro', zero_division=0)
+    f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    print(f"\n{name} | Acc: {acc:.4f} | Prec(macro): {prec_macro:.4f} | Rec(macro): {rec_macro:.4f} | F1(macro): {f1_macro:.4f}")
+    print(classification_report(y_true, y_pred, target_names=labels_list if labels_list is not None else le.classes_))
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(6,5))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=(labels_list if labels_list else le.classes_), yticklabels=(labels_list if labels_list else le.classes_))
+    plt.xlabel("Predicted"); plt.ylabel("True"); plt.title(f"Confusion Matrix: {name}")
+    if output_prefix:
+        plt.savefig(f"{output_prefix}_confusion.png", bbox_inches='tight')
+    plt.show()
+    return {"accuracy": acc, "precision_macro": prec_macro, "recall_macro": rec_macro, "f1_macro": f1_macro}
+#############################################################################################################################################
+
+# ML Model Training and Evaluation
+features = {
+    "TFIDF": (X_train_tfidf, X_test_tfidf),
+    "Word2Vec": (X_train_w2v, X_test_w2v),
+    "FastText": (X_train_ft, X_test_ft),
+    "Emoji2Vec": (X_train_emoji_tf, X_test_emoji_tf),
+    "BERT": (X_train_bert, X_test_bert)
+}
+ml_models = {
+    "LogisticRegression": LogisticRegression(max_iter=1000, class_weight='balanced'),
+    "SVM": LinearSVC(class_weight='balanced', max_iter=2000),
+    "RandomForest": RandomForestClassifier(n_estimators=200, n_jobs=-1, class_weight='balanced'),
+    "DecisionTree": DecisionTreeClassifier(class_weight='balanced'),
+    "GradientBoosting": GradientBoostingClassifier(),
+    "NaiveBayes": MultinomialNB()
+}
+results = []
+os.makedirs("conf_matrices", exist_ok=True)
+for feat_name, (Xtr, Xte) in features.items():
+    print("\n\n==== FEATURE:", feat_name, "====")
+    for model_name, model in ml_models.items():
+        if model_name == "NaiveBayes" and (feat_name == "Word2Vec" or feat_name == "BERT"):
+             print(f"\n>> Skipping NaiveBayes with {feat_name} (requires non-negative input)")
+             continue
+        print("\n>> Model:", model_name)
+        try:
+            model_instance = model
+            model_instance.fit(Xtr, y_train)
+            y_pred = model_instance.predict(Xte)
+            r = eval_and_report(f"{model_name} + {feat_name}", y_test, y_pred, output_prefix=f"conf_matrices/{model_name}_{feat_name}")
+            r.update({"model": model_name, "feature": feat_name})
+            results.append(r)
+            os.makedirs("models", exist_ok=True)
+            joblib.dump(model_instance, f"models/{model_name}_{feat_name}.joblib")
+        except Exception as e:
+            print("Error training", model_name, feat_name, "->", e)
+        gc.collect()
+results_df = pd.DataFrame(results)
+results_df.to_csv("ml_results_summary.csv", index=False)
+
+#############################################################################################################################################
+
+# Simple Logistic Regression on BERT embeddings (already included in the ML loop above, but keeping for completeness if needed separately)
+# print("Training LogisticRegression on BERT features")
+# clf_bert = LogisticRegression(max_iter=1000, class_weight='balanced')
+# clf_bert.fit(X_train_bert, y_train)
+# y_pred_bert = clf_bert.predict(X_test_bert)
+# bert_metrics = eval_and_report("LogReg + BERT", y_test, y_pred_bert, output_prefix="conf_matrices/LogReg_BERT")
+# bert_metrics.update({"model":"LogisticRegression","feature":"BERT"})
+
+#############################################################################################################################################
+
+# DL Model Training and Evaluation
+def make_dl_model(model_type, embedding_matrix=None, trainable_emb=False, input_len=MAX_LEN, emb_dim=100, num_classes=num_classes):
+    model = Sequential()
+    if embedding_matrix is not None:
+        model.add(Embedding(input_dim=vocab_size, output_dim=embedding_matrix.shape[1],
+                            input_length=input_len, weights=[embedding_matrix], trainable=trainable_emb))
+    else:
+        model.add(Embedding(input_dim=vocab_size, output_dim=emb_dim, input_length=input_len))
+    if model_type == "CNN":
+        model.add(Conv1D(128, 5, activation='relu'))
+        model.add(MaxPooling1D(pool_size=2))
+    elif model_type == "RNN":
+        model.add(SimpleRNN(128))
+    elif model_type == "LSTM":
+        model.add(LSTM(128))
+    elif model_type == "BiLSTM":
+        model.add(Bidirectional(LSTM(128)))
+    elif model_type == "GRU":
+        model.add(GRU(128))
+    model.add(Dropout(0.5))
+    model.add(Dense(64, activation='relu'))
+    model.add(Dense(num_classes, activation='softmax'))
+    model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
+    return model
+
+dl_models = ["CNN", "RNN", "LSTM", "BiLSTM", "GRU"]
+emb_configs_dl = { # Renamed to avoid conflict with ML features
+    "TFIDF": tfidf_emb_matrix,
+    "Word2Vec": w2v_emb_matrix,
+    "Emoji2Vec": emoji_vec_emb_matrix,
+    "FastText": ft_emb_matrix,
+    "BERT": bert_emb_matrix,
+}
+
+dl_results = []
+os.makedirs("conf_matrices", exist_ok=True)
+for emb_name, emb_matrix in emb_configs_dl.items():
+    for mtype in dl_models:
+        print("\n=== DL:", mtype, "with", emb_name, "embeddings ===")
+        current_emb_dim = emb_matrix.shape[1] if emb_matrix is not None else 100
+        model = make_dl_model(mtype, embedding_matrix=emb_matrix, trainable_emb=False, emb_dim=current_emb_dim)
+        es = EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
+        ckpt_path = f"models/dl_{mtype}_{emb_name}.h5"
+        mc = ModelCheckpoint(ckpt_path, monitor='val_loss', save_best_only=True)
+        history = model.fit(X_train_pad, y_train_cat, validation_split=0.1, epochs=8, batch_size=64, callbacks=[es, mc], verbose=2)
+        preds_proba = model.predict(X_test_pad)
+        preds = preds_proba.argmax(axis=1)
+        metrics = eval_and_report(f"{mtype} + {emb_name}", y_test, preds, output_prefix=f"conf_matrices/{mtype}_{emb_name}")
+        metrics.update({"model": mtype, "feature": emb_name, "history": history})
+        dl_results.append(metrics)
+        os.makedirs("models", exist_ok=True)
+        model.save(ckpt_path)
+        gc.collect()
+dl_df = pd.DataFrame(dl_results)
+
+#############################################################################################################################################
+
+# Summarize Results
+try:
+    ml_df_loaded = pd.read_csv("ml_results_summary.csv")
+except pd.errors.EmptyDataError:
+    ml_df_loaded = pd.DataFrame()
+
+# Combine all results
+all_results = pd.concat([ml_df_loaded, dl_df], ignore_index=True, sort=False)
+all_results = all_results[['model','feature','accuracy','precision_macro','recall_macro','f1_macro']].sort_values('f1_macro', ascending=False)
+all_results.to_csv("all_models_results_summary.csv", index=False)
+
+# Separate ML and DL results for display
+ml_results_df = all_results[all_results['model'].isin(ml_models.keys())].sort_values('accuracy', ascending=False)
+dl_results_df = all_results[all_results['model'].isin(dl_models)].sort_values('accuracy', ascending=False)
+
+print("--- ML Model Results (Sorted by accuracy) ---")
+display(ml_results_df.head(300))
+
+print("\n--- DL Model Results (Sorted by accuracy) ---")
+display(dl_results_df.head(300))
+
+best = all_results.iloc[0]
+print("\nBest overall model:", best.to_dict())
+print("Best combination:", best['model'], "with", best['feature'], "features")
